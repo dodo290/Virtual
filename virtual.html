@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="ar">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AR Sunglasses Try-on — Double Edge</title>
+<style>
+  :root { --accent: #ff9100; }
+  html,body { height:100%; margin:0; background:#000; font-family:Tahoma,Arial; }
+  video { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; }
+  canvas { position:fixed; inset:0; pointer-events:none; }
+  /* زرار الفريم (دائري) */
+  #frameButton {
+    position:fixed;
+    bottom:28px;
+    left:50%;
+    transform:translateX(-50%);
+    width:96px;
+    height:96px;
+    border-radius:50%;
+    background:linear-gradient(180deg, rgba(255,145,0,0.95), rgba(200,80,0,0.95));
+    border:6px solid rgba(0,0,0,0.6);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    z-index:1000;
+    box-shadow:0 10px 30px rgba(0,0,0,0.5);
+  }
+  #frameButton img { width:56px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.6)); }
+  /* رسالة صغيرة لو الكاميرا مش متاحة */
+  #msg { position:fixed; top:10px; left:50%; transform:translateX(-50%); color:#fff; background:rgba(0,0,0,0.45); padding:8px 12px; border-radius:8px; z-index:1000; font-size:14px; display:none; }
+</style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+
+<div id="msg">يرجى السماح بالكاميرا للعملية التجريبية</div>
+
+<!-- زرار الفريم يظهر طول الوقت كما طلبت -->
+<div id="frameButton" title="Frame">
+  <!-- أيقونة نظارة بسيطة (يمكن تغييره محلياً) -->
+  <img src="pictures of glasses/double edge vision/DEV.3.png" alt="frame">
+</div>
+
+<script type="module">
+// --------- إعداد المسارات للصور (غير متغير — حسب ما أعطيت) ----------
+const LEFT_SRC  = "pictures of glasses/double edge vision/left.1.png";
+const RIGHT_SRC = "pictures of glasses/double edge vision/right.1.png";
+const ARM_SRC   = "pictures of glasses/double edge vision/hand.png";
+// ------------------------------------------------------------------
+
+// smoothing factor for landmarks (0=no smoothing, closer to 1 = heavier smoothing)
+const SMOOTHING = 0.6;
+
+import { FaceMesh } from "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js";
+import { Camera } from "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js";
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const frameBtn = document.getElementById('frameButton');
+const msg = document.getElementById('msg');
+
+function resizeCanvas(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// تحميل الصور من المسارات التي زودتنا بها
+const leftImg  = new Image(); leftImg.src  = LEFT_SRC;
+const rightImg = new Image(); rightImg.src = RIGHT_SRC;
+const armImg   = new Image(); armImg.src   = ARM_SRC;
+
+// state
+let latestLandmarks = null;
+let smoothLandmarks = null;
+let cameraStarted = false;
+
+// MediaPipe FaceMesh
+const faceMesh = new FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true,
+  minDetectionConfidence: 0.55,
+  minTrackingConfidence: 0.5
+});
+faceMesh.onResults(onFaceResults);
+
+// طلب الكاميرا تلقائياً عند فتح الصفحة
+async function initCameraAuto() {
+  try {
+    // نطلب أولا صلاحية الكاميرا لكي يظهر الـ permission prompt فوراً
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+    // لو نجحنا، نركب الـ stream على الفيديو ونبدأ Mediapipe Camera wrapper
+    video.srcObject = stream;
+    // Use Camera util only to get frames into faceMesh; construct a Camera wrapper that reads from video element
+    const cam = new Camera(video, {
+      onFrame: async () => { await faceMesh.send({image: video}); },
+      width: 1280,
+      height: 720
+    });
+    cam.start();
+    cameraStarted = true;
+    msg.style.display = 'none';
+  } catch (e) {
+    console.error("Camera start failed:", e);
+    msg.style.display = 'block';
+    msg.textContent = "لم يتم منح إذن الكاميرا. رجاءً سمح باستخدام الكاميرا ثم أعد تحميل الصفحة.";
+  }
+}
+
+// نبدأ المحاولة فوراً عند تحميل الصفحة
+window.addEventListener('load', () => {
+  initCameraAuto();
+  // زرار الفريم لا يُغلق تلقائياً (حسب طلبك). يمكن الضغط عليه لاختبار/تبديل تأثير بسيط لاحقاً.
+});
+
+// معالجة نتائج FaceMesh
+function onFaceResults(results){
+  if(!results || !results.multiFaceLandmarks || !results.multiFaceLandmarks.length) {
+    latestLandmarks = null;
+    return;
+  }
+  latestLandmarks = results.multiFaceLandmarks[0];
+
+  // smoothing simple exponential moving average on landmark coords
+  if(!smoothLandmarks){
+    // clone first time
+    smoothLandmarks = latestLandmarks.map(p => ({x:p.x, y:p.y, z:p.z || 0}));
+  } else {
+    for(let i=0;i<latestLandmarks.length;i++){
+      smoothLandmarks[i].x = SMOOTHING * smoothLandmarks[i].x + (1-SMOOTHING) * latestLandmarks[i].x;
+      smoothLandmarks[i].y = SMOOTHING * smoothLandmarks[i].y + (1-SMOOTHING) * latestLandmarks[i].y;
+      smoothLandmarks[i].z = SMOOTHING * smoothLandmarks[i].z + (1-SMOOTHING) * (latestLandmarks[i].z || 0);
+    }
+  }
+  drawFrame();
+}
+
+// تحويل نقطة من normalized (0..1) إلى بكسل على الكانفس
+function toPixel(pt){
+  return { x: pt.x * canvas.width, y: pt.y * canvas.height };
+}
+
+// رسم النظارة بناءً على العلامات الملساء
+function drawFrame(){
+  if(!smoothLandmarks) return;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // استخدم مراكز القزحية (أفضل دقة للعيون) — مراجع Mediapipe
+  // مراجع Iris centers (468..477 for left iris? depends — we use indices that worked in previous code)
+  // سأستخدم 468 (left iris center) و 473 (right iris center) كما في الكود سابق
+  const leftIrisIdx  = 468;
+  const rightIrisIdx = 473;
+
+  const L = toPixel(smoothLandmarks[leftIrisIdx] || smoothLandmarks[33]);  // fallback
+  const R = toPixel(smoothLandmarks[rightIrisIdx] || smoothLandmarks[263]); // fallback
+
+  // زاوية الميل بين العينين
+  const angle = Math.atan2(R.y - L.y, R.x - L.x);
+
+  // مسافة بين العينين (بكسل) لاستخدامها كمقياس
+  const eyeDist = Math.hypot(R.x - L.x, R.y - L.y);
+
+  // قياسات العدسات (حجم مرن بناءً على eyeDist)
+  // القيم الضابطة هنا مُصممة لتقارب شكل الإطار المزدوج في الصورة التي أرسلتها
+  const lensWidth  = eyeDist * 1.55; // تعديل إن احتجت تكبير/تصغير
+  const lensHeight = lensWidth * (leftImg.naturalHeight / Math.max(leftImg.naturalWidth,1) || 0.45);
+
+  // رسم عدسة واحدة مع دوران ومركز
+  function drawLens(img, cx, cy, flip=false){
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    if(flip) ctx.scale(-1,1);
+    ctx.drawImage(img, -lensWidth/2, -lensHeight/2, lensWidth, lensHeight);
+    ctx.restore();
+  }
+
+  // رسم العدستين
+  drawLens(leftImg, L.x, L.y, false);
+  drawLens(rightImg, R.x, R.y, false);
+
+  // الآن نربط الذراعين بالأذن
+  // نستخدم نقاط قريبة من الأذن: 127 (left) و 356 (right) — Mediapipe face topology
+  const leftEarPt  = toPixel(smoothLandmarks[127] || smoothLandmarks[234]);
+  const rightEarPt = toPixel(smoothLandmarks[356] || smoothLandmarks[454]);
+
+  // أبعاد الذراع (تقريبية، تعتمد على eyeDist)
+  const armW = eyeDist * 1.9;
+  const armH = armW * (armImg.naturalHeight / Math.max(armImg.naturalWidth,1) || 0.2);
+
+  // رسم الذراع الأيسر
+  ctx.save();
+  ctx.translate(leftEarPt.x, leftEarPt.y);
+  // نريد أن يميل الذراع بنفس زاوية النظارة لكن قليلاً للخلف: نستخدم نفس angle
+  ctx.rotate(angle);
+  ctx.drawImage(armImg, -armW, -armH/2, armW, armH);
+  ctx.restore();
+
+  // رسم الذراع الأيمن (مقلوب أفقياً)
+  ctx.save();
+  ctx.translate(rightEarPt.x, rightEarPt.y);
+  ctx.rotate(angle);
+  ctx.scale(-1,1);
+  ctx.drawImage(armImg, 0, -armH/2, armW, armH);
+  ctx.restore();
+
+  // (اختياري) رسم جسر بين العدستين لو احتجت — هنا نرسم شفاف بسيط يعتمد على منتصف العينين
+  const bridgeX = (L.x + R.x) / 2;
+  const bridgeY = (L.y + R.y) / 2;
+  // يمكنك تعطيل الرسم التالي لو لا تحب
+  ctx.save();
+  ctx.translate(bridgeX, bridgeY);
+  ctx.rotate(angle);
+  ctx.globalAlpha = 0.0; // 0 => مخفي. اجعله 0.4 لو عايز جسر مرئي
+  ctx.fillStyle = "#000";
+  ctx.fillRect(-eyeDist*0.12, -lensHeight*0.12, eyeDist*0.24, lensHeight*0.24);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// زرار الفريم: يمكنك ربطه لوظائف إضافية (مثلاً فتح/غلق تأثير، التقاط صورة)
+// الآن نعرض رسالة قصيرة عند النقر
+frameBtn.addEventListener('click', () => {
+  // مؤقتاً: نشوف لو الكاميرا شغالة نعرض فلاش تقاط صورة
+  if(!cameraStarted){
+    msg.style.display = 'block';
+    msg.textContent = "جاري محاولة تشغيل الكاميرا... إذا لم تعمل، افتح الصفحة عبر localhost أو امنح الإذن.";
+    initCameraAuto();
+    return;
+  }
+  // تأثير بصري صغير عند الضغط: نرسم إطار قصير
+  frameBtn.animate([{ transform: 'translateX(-50%) scale(1)' }, { transform: 'translateX(-50%) scale(0.9)' }, { transform: 'translateX(-50%) scale(1)' }], { duration: 300 });
+});
+
+// لو الصورة لم تُحمّل بعد، نعرض تحذير في الكونسل (لا يؤثر على التشغيل)
+[leftImg, rightImg, armImg].forEach(img=>{
+  img.addEventListener('error', ()=> console.warn('Failed loading image:', img.src));
+});
+
+// ملاحظة: إذا أردت إضافة زر حفظ للـ canvas أو تحكمات لعمل Fine-tune للـ scale/offset,
+// أضيفها لك بسهولة لو قلت "ضيف تحكمات".
+</script>
+</body>
+</html>
